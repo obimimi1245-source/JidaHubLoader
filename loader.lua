@@ -1,5 +1,5 @@
 -- ============================================================
---  JIDA LOADER (HttpGet-only)
+--  JIDA LOADER v3 (HttpGet + robust JSON unescape)
 -- ============================================================
 local SUPABASE_URL = "https://vgnuursmimytngrxrcus.supabase.co"
 local SUPABASE_KEY = "sb_publishable_hCWbfjIp7CTDMUsQMwzHkQ_Ip91FFKN"
@@ -25,7 +25,6 @@ local function getHWID()
 end
 local HWID = getHWID()
 
--- URL-encode (для ключей и HWID с спецсимволами)
 local function urlEncode(s)
     s = tostring(s)
     s = s:gsub("([^%w%-%_%.%~])", function(c)
@@ -34,7 +33,39 @@ local function urlEncode(s)
     return s
 end
 
--- Мини-окно ввода ключа
+-- Ручная расшифровка JSON-строки (когда JSONDecode не справляется)
+local function manualUnescape(s)
+    if type(s) ~= "string" then return s end
+    -- убираем внешние кавычки
+    if s:sub(1,1) == '"' and s:sub(-1) == '"' then
+        s = s:sub(2, -2)
+    end
+    -- \n, \r, \t, \", \\ и unicode \uXXXX
+    s = s:gsub("\\u(%x%x%x%x)", function(hex)
+        local code = tonumber(hex, 16)
+        if code and code < 128 then return string.char(code) end
+        -- для не-ASCII возвращаем как есть (кириллица в комментариях)
+        return ""
+    end)
+    s = s:gsub('\\"', '"')
+    s = s:gsub("\\'", "'")
+    s = s:gsub("\\n", "\n")
+    s = s:gsub("\\r", "\r")
+    s = s:gsub("\\t", "\t")
+    s = s:gsub("\\\\", "\\")
+    return s
+end
+
+-- Проверяем, что это настоящий Lua-код
+local function looksLikeLua(s)
+    if type(s) ~= "string" or #s < 20 then return false end
+    -- первые непустые символы не должны быть " или {
+    local head = s:sub(1, 40)
+    if head:match('^%s*["{]') then return false end
+    return true
+end
+
+-- Мини-окно
 local function promptKey()
     local pg = LPlayer:WaitForChild("PlayerGui")
     local old = pg:FindFirstChild("JidaLoaderGui")
@@ -81,7 +112,6 @@ local function promptKey()
     btn.Font = Enum.Font.GothamBold; btn.TextSize = 15; btn.Parent = frame
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
 
-    -- перетаскивание
     do
         local dragging, dragStart, startPos
         title.InputBegan:Connect(function(input)
@@ -114,33 +144,39 @@ local function fetchScript(key)
 
     local ok, body = pcall(function() return game:HttpGet(url) end)
     if not ok or not body then
-        return nil, "HTTP error: " .. tostring(body)
+        return nil, "HTTP error"
     end
-    if #body < 5 then
-        return nil, "Пустой ответ: " .. body
-    end
+    if #body < 5 then return nil, "Пустой ответ" end
 
-    local decoded
+    -- 1) пробуем JSONDecode
+    local decoded = nil
     local okD, res = pcall(HttpService.JSONDecode, HttpService, body)
-    if okD then decoded = res else decoded = body end
+    if okD then decoded = res end
 
-    if decoded == nil then
+    -- 2) если не сработал — ручной unescape
+    if type(decoded) ~= "string" then
+        decoded = manualUnescape(body)
+    end
+
+    -- 3) если всё ещё выглядит как JSON — попробуем ещё раз
+    if not looksLikeLua(decoded) then
+        local second = manualUnescape(decoded)
+        if looksLikeLua(second) then decoded = second end
+    end
+
+    if type(decoded) ~= "string" or #decoded < 20 then
+        return nil, "Не удалось получить скрипт (тип: " .. type(decoded) .. ")"
+    end
+
+    if decoded == "null" then
         return nil, "Ключ не найден или истёк"
     end
-    if type(decoded) == "string" then
-        if #decoded < 20 then
-            return nil, "Короткий скрипт"
-        end
-        return decoded
+
+    if not looksLikeLua(decoded) then
+        return nil, "Скрипт не похож на Lua (первые: " .. decoded:sub(1,30) .. ")"
     end
 
-    -- если пришла таблица с ошибкой
-    if type(decoded) == "table" then
-        local msg = decoded.message or decoded.error or HttpService:JSONEncode(decoded)
-        return nil, "Сервер: " .. tostring(msg):sub(1, 100)
-    end
-
-    return nil, "Неизвестный ответ: " .. tostring(decoded):sub(1, 80)
+    return decoded
 end
 
 -- Запуск
@@ -167,6 +203,8 @@ local function tryLoad()
             local fn, loadErr = loadstring(code)
             if not fn then
                 warn("[Jida] Ошибка компиляции: " .. tostring(loadErr))
+                -- для отладки: покажем первые 200 символов кода
+                warn("[Jida] Первые 200 символов:", code:sub(1, 200))
                 return
             end
             local ok2, runErr = pcall(fn)
