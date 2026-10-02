@@ -1,5 +1,5 @@
 -- ============================================================
---  JIDA LOADER v3 (HttpGet + robust JSON unescape)
+--  JIDA LOADER v5 (multi-candidate)
 -- ============================================================
 local SUPABASE_URL = "https://vgnuursmimytngrxrcus.supabase.co"
 local SUPABASE_KEY = "sb_publishable_hCWbfjIp7CTDMUsQMwzHkQ_Ip91FFKN"
@@ -9,7 +9,6 @@ local UIS         = game:GetService("UserInputService")
 local Players     = game:GetService("Players")
 local LPlayer     = Players.LocalPlayer
 
--- HWID
 local function getHWID()
     local fns = {
         function() return _G.gethwid and _G.gethwid() end,
@@ -26,46 +25,80 @@ end
 local HWID = getHWID()
 
 local function urlEncode(s)
-    s = tostring(s)
-    s = s:gsub("([^%w%-%_%.%~])", function(c)
+    return (tostring(s):gsub("([^%w%-%_%.%~])", function(c)
         return string.format("%%%02X", string.byte(c))
-    end)
-    return s
+    end))
 end
 
--- Ручная расшифровка JSON-строки (когда JSONDecode не справляется)
-local function manualUnescape(s)
+local function deepUnescape(s)
     if type(s) ~= "string" then return s end
-    -- убираем внешние кавычки
-    if s:sub(1,1) == '"' and s:sub(-1) == '"' then
-        s = s:sub(2, -2)
+    for pass = 1, 3 do
+        local before = s
+        s = s:gsub('\\"',  '"')
+        s = s:gsub("\\'",  "'")
+        s = s:gsub("\\n",  "\n")
+        s = s:gsub("\\r",  "\r")
+        s = s:gsub("\\t",  "\t")
+        s = s:gsub("\\\\", "\\")
+        s = s:gsub("\\/",  "/")
+        if s == before then break end
     end
-    -- \n, \r, \t, \", \\ и unicode \uXXXX
-    s = s:gsub("\\u(%x%x%x%x)", function(hex)
-        local code = tonumber(hex, 16)
-        if code and code < 128 then return string.char(code) end
-        -- для не-ASCII возвращаем как есть (кириллица в комментариях)
-        return ""
-    end)
-    s = s:gsub('\\"', '"')
-    s = s:gsub("\\'", "'")
-    s = s:gsub("\\n", "\n")
-    s = s:gsub("\\r", "\r")
-    s = s:gsub("\\t", "\t")
-    s = s:gsub("\\\\", "\\")
     return s
 end
 
--- Проверяем, что это настоящий Lua-код
-local function looksLikeLua(s)
-    if type(s) ~= "string" or #s < 20 then return false end
-    -- первые непустые символы не должны быть " или {
-    local head = s:sub(1, 40)
-    if head:match('^%s*["{]') then return false end
-    return true
+local function stripQuotes(s)
+    if type(s) ~= "string" then return s end
+    local changed = true
+    local guard = 0
+    while changed and guard < 5 do
+        changed = false
+        if s:sub(1,1) == '"' then s = s:sub(2); changed = true end
+        if s:sub(-1) == '"' then s = s:sub(1, -2); changed = true end
+        guard = guard + 1
+    end
+    return s
 end
 
--- Мини-окно
+local function tryCandidates(body)
+    local candidates = {}
+    local seen = {}
+
+    local function add(name, str)
+        if type(str) == "string" and #str > 20 and not seen[str] then
+            seen[str] = true
+            candidates[#candidates+1] = { name = name, code = str }
+        end
+    end
+
+    local ok, res = pcall(HttpService.JSONDecode, HttpService, body)
+    if ok and type(res) == "string" then add("JSONDecode", res) end
+    add("raw", body)
+    add("stripped", stripQuotes(body))
+    add("unescaped", deepUnescape(stripQuotes(body)))
+    add("unescaped2", deepUnescape(deepUnescape(stripQuotes(body))))
+
+    local report = {}
+    for i, c in ipairs(candidates) do
+        local fn, err = loadstring(c.code)
+        if fn then
+            print(string.format("[Loader] OK через кандидат #%d (%s)", i, c.name))
+            return c.code, nil, fn
+        else
+            report[#report+1] = string.format("#%d (%s): %s", i, c.name, tostring(err):sub(1, 60))
+        end
+    end
+
+    print("=== JIDA LOADER DEBUG ===")
+    print("Длина body:", #body)
+    print("Первые 300 символов body:")
+    print(body:sub(1, 300))
+    print("---")
+    for _, line in ipairs(report) do print("  " .. line) end
+    print("=========================")
+
+    return nil, "Не удалось загрузить (F9 — детали)"
+end
+
 local function promptKey()
     local pg = LPlayer:WaitForChild("PlayerGui")
     local old = pg:FindFirstChild("JidaLoaderGui")
@@ -134,8 +167,7 @@ local function promptKey()
     return gui, box, status, btn
 end
 
--- Получить скрипт через GET RPC
-local function fetchScript(key)
+local function fetchFromServer(key)
     local url = SUPABASE_URL
         .. "/rest/v1/rpc/get_script"
         .. "?apikey=" .. urlEncode(SUPABASE_KEY)
@@ -143,43 +175,12 @@ local function fetchScript(key)
         .. "&p_hwid=" .. urlEncode(HWID)
 
     local ok, body = pcall(function() return game:HttpGet(url) end)
-    if not ok or not body then
-        return nil, "HTTP error"
+    if not ok or not body or #body < 5 then
+        return nil, "Сервер недоступен"
     end
-    if #body < 5 then return nil, "Пустой ответ" end
-
-    -- 1) пробуем JSONDecode
-    local decoded = nil
-    local okD, res = pcall(HttpService.JSONDecode, HttpService, body)
-    if okD then decoded = res end
-
-    -- 2) если не сработал — ручной unescape
-    if type(decoded) ~= "string" then
-        decoded = manualUnescape(body)
-    end
-
-    -- 3) если всё ещё выглядит как JSON — попробуем ещё раз
-    if not looksLikeLua(decoded) then
-        local second = manualUnescape(decoded)
-        if looksLikeLua(second) then decoded = second end
-    end
-
-    if type(decoded) ~= "string" or #decoded < 20 then
-        return nil, "Не удалось получить скрипт (тип: " .. type(decoded) .. ")"
-    end
-
-    if decoded == "null" then
-        return nil, "Ключ не найден или истёк"
-    end
-
-    if not looksLikeLua(decoded) then
-        return nil, "Скрипт не похож на Lua (первые: " .. decoded:sub(1,30) .. ")"
-    end
-
-    return decoded
+    return body
 end
 
--- Запуск
 local gui, box, status, btn = promptKey()
 local success = false
 
@@ -193,26 +194,33 @@ local function tryLoad()
     btn.Text = "..."
 
     task.spawn(function()
-        local code, err = fetchScript(key)
-        if code then
-            status.Text = "Загрузка..."
-            status.TextColor3 = Color3.fromRGB(80,220,120)
-            task.wait(0.3)
+        local body, err = fetchFromServer(key)
+        if not body then
+            status.Text = err or "Ошибка сервера"
+            status.TextColor3 = Color3.fromRGB(255,100,100)
+            btn.Text = "Загрузить"
+            return
+        end
+
+        if body == "null" or body == '""' then
+            status.Text = "Ключ не найден или истёк"
+            status.TextColor3 = Color3.fromRGB(255,100,100)
+            btn.Text = "Загрузить"
+            return
+        end
+
+        local code, loadErr, fn = tryCandidates(body)
+        if code and fn then
+            status.Text = "Загрузка..."; status.TextColor3 = Color3.fromRGB(80,220,120)
+            task.wait(0.2)
             gui:Destroy()
             success = true
-            local fn, loadErr = loadstring(code)
-            if not fn then
-                warn("[Jida] Ошибка компиляции: " .. tostring(loadErr))
-                -- для отладки: покажем первые 200 символов кода
-                warn("[Jida] Первые 200 символов:", code:sub(1, 200))
-                return
-            end
             local ok2, runErr = pcall(fn)
             if not ok2 then
                 warn("[Jida] Ошибка выполнения: " .. tostring(runErr))
             end
         else
-            status.Text = (err or "Неверный ключ"):sub(1, 60)
+            status.Text = (loadErr or "Не удалось загрузить"):sub(1, 60)
             status.TextColor3 = Color3.fromRGB(255,100,100)
             btn.Text = "Загрузить"
         end
